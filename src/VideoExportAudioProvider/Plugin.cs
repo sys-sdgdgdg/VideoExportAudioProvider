@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
@@ -8,14 +8,14 @@ namespace VideoExportAudioProvider
 {
     [BepInPlugin(GUID, Name, Version)]
     [BepInProcess("CharaStudio")]
-    [BepInDependency(global::VideoExport.VideoExport.GUID, DependencyFlags.SoftDependency)]
+    [BepInDependency(global::VideoExport.VideoExport.GUID)]
     public class VideoExportAudioProviderPlugin : BaseUnityPlugin
     {
         public const string GUID = "VideoExportAudioProvider";
         public const string Name = "VideoExportAudioProvider";
         public const string Version = "1.0.0";
 
-        internal static ManualLogSource Logger;
+        internal static new ManualLogSource Logger;
 
         private ConfigEntry<string> _audioFilePath;
 
@@ -35,7 +35,7 @@ namespace VideoExportAudioProvider
             var videoExport = FindObjectOfType<global::VideoExport.VideoExport>();
             if (videoExport == null)
             {
-                Logger.LogWarning($"VideoExport not found (guid {global::VideoExport.VideoExport.GUID}). Install VideoExport r2.24 or newer from IllusionMods/HSPlugins releases - this plugin does nothing without it.");
+                Logger.LogWarning("VideoExport not found (guid " + global::VideoExport.VideoExport.GUID + "). Install VideoExport r2.24 or newer from IllusionMods/HSPlugins releases - this plugin does nothing without it.");
                 enabled = false;
                 return;
             }

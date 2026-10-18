@@ -11,7 +11,7 @@
 
   <Target Name="RequireGameDir" BeforeTargets="ResolveAssemblyReferences"
           Condition="'$(GameDir)' == '' or !Exists('$(GameDir)')">
-    <Error Text="Point GameDir at your Koikatsu game folder, e.g. dotnet build -p:GameDir="C:\Games\Koikatsu" (or set the KK_DIR environment variable). BepInEx, CharaStudio and the VideoExport plugin must be installed there." />
+    <Error Text="Point GameDir at your Koikatsu game folder, e.g. dotnet build -p:GameDir='C:\Games\Koikatsu' (or set the KK_DIR environment variable). BepInEx, CharaStudio and the VideoExport plugin must be installed there." />
   </Target>
 
   <ItemGroup>
