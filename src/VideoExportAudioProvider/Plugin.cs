@@ -13,10 +13,12 @@ namespace VideoExportAudioProvider
     {
         public const string GUID = "VideoExportAudioProvider";
         public const string Name = "VideoExportAudioProvider";
-        public const string Version = "1.3.0";
+        public const string Version = "1.4.0";
 
         internal static new ManualLogSource Logger;
         internal static ConfigEntry<bool> MuteDuringExport;
+        internal static ConfigEntry<bool> ApplyChannelVolume;
+        internal static ConfigEntry<bool> SpatialAudioApproximation;
 
         private ConfigEntry<string> _audioFilePath;
 
@@ -35,6 +37,18 @@ namespace VideoExportAudioProvider
                 "Mute during export",
                 true,
                 "Mutes the game's live audio while VideoExport is rendering so the slow-motion playback of studio sounds doesn't blast out of your speakers. The exported video still gets its audio from the offline-rendered track.");
+
+            ApplyChannelVolume = Config.Bind(
+                "General",
+                "Apply game channel volume",
+                true,
+                "Apply the game's AudioMixer channel and master volumes (the sound sliders in the game options) to the exported audio, matching what you hear in-game. Channel volumes are read live at export time.");
+
+            SpatialAudioApproximation = Config.Bind(
+                "General",
+                "3D audio approximation",
+                true,
+                "Approximate Unity 3D audio in the export: distance rolloff from the studio camera (position at export start) with the item's own rolloff mode and range, plus constant-power stereo panning from the camera-relative direction. Items farther than their max distance are silent, like Unity's voice culling.");
 
             new Harmony(GUID).PatchAll(typeof(Patches).Assembly);
         }
