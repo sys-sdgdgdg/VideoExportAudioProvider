@@ -2,6 +2,9 @@
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Text;
+using BepInEx;
 using HarmonyLib;
 using Studio;
 using UnityEngine;
@@ -25,6 +28,9 @@ namespace VideoExportAudioProvider
     /// mid-loop (or after several loops) and cover wrapped keyframe occurrences. All event
     /// math is done on the looped axis: each keyframe's occurrences inside the export range
     /// are computed and mapped to "output time" (seconds since the first audio sample).
+    ///
+    /// Every export also writes UserData/StudioSoundManifest.txt comparing the Timeline
+    /// nodes with the sound windows that were actually mixed, for troubleshooting.
     /// </summary>
     public class StudioSoundProvider : IAudioPlugin
     {
@@ -39,6 +45,23 @@ namespace VideoExportAudioProvider
             public float Volume;
         }
 
+        private class NodeDump
+        {
+            public string ItemName;
+            public string ClipName;
+            public bool Loop;
+            public float Volume;
+            public string SoundType;
+            public string Keyframes;
+            public string Windows;
+        }
+
+        private class CollectResult
+        {
+            public readonly List<SoundEvent> Events = new List<SoundEvent>();
+            public readonly List<NodeDump> Nodes = new List<NodeDump>();
+        }
+
         public string Name { get { return "Studio sounds"; } }
 
         public string SafeName { get { return "StudioSounds"; } }
@@ -47,23 +70,25 @@ namespace VideoExportAudioProvider
         {
             try
             {
-                List<SoundEvent> events = CollectEvents(startTime, duration);
-                if (events.Count == 0)
+                CollectResult collected = CollectEvents(startTime, duration);
+                if (collected.Events.Count == 0)
                 {
                     VideoExportAudioProviderPlugin.Logger.LogInfo("No Timeline-triggered studio sounds found for this export.");
+                    WriteManifest(startTime, duration, sampleRate, collected);
                     return null;
                 }
 
                 int frames = Mathf.CeilToInt(duration * sampleRate);
                 var mix = new float[frames * 2];
 
-                float loopedStart = LoopStartTime(startTime, duration);
+                float loopedStart = LoopStartTime(startTime, TimelineDuration());
 
-                foreach (SoundEvent e in events)
+                foreach (SoundEvent e in collected.Events)
                     MixEvent(mix, e, loopedStart, sampleRate);
 
                 byte[] wav = ToWav16(mix, sampleRate);
-                VideoExportAudioProviderPlugin.Logger.LogInfo($"Mixed {events.Count} sound clip event(s) into {wav.Length / 1024} KB of audio.");
+                VideoExportAudioProviderPlugin.Logger.LogInfo($"Mixed {collected.Events.Count} sound clip event(s) into {wav.Length / 1024} KB of audio.");
+                WriteManifest(startTime, duration, sampleRate, collected);
                 return new BinaryReader(new MemoryStream(wav));
             }
             catch (Exception e)
@@ -90,9 +115,24 @@ namespace VideoExportAudioProvider
             return PositiveMod(startTime, timelineDuration);
         }
 
-        private static List<SoundEvent> CollectEvents(float startTime, float audioDuration)
+        private static float TimelineDuration()
         {
-            var result = new List<SoundEvent>();
+            try
+            {
+                var self = Traverse.Create(typeof(global::Timeline.Timeline)).Field("_self").GetValue() as global::Timeline.Timeline;
+                if (self == null)
+                    return 0f;
+                return global::Timeline.Timeline.duration;
+            }
+            catch
+            {
+                return 0f;
+            }
+        }
+
+        private static CollectResult CollectEvents(float startTime, float audioDuration)
+        {
+            var result = new CollectResult();
 
             var timelineSelf = Traverse.Create(typeof(global::Timeline.Timeline)).Field("_self").GetValue() as global::Timeline.Timeline;
             if (timelineSelf == null)
@@ -128,19 +168,74 @@ namespace VideoExportAudioProvider
                 if (se == null || se.Clip == null)
                     continue;
 
+                var node = new NodeDump
+                {
+                    ItemName = GetItemName(ociItem),
+                    ClipName = se.Clip.name,
+                    Loop = se.IsLoop,
+                    Volume = se.Volume,
+                    SoundType = se.SoundType.ToString()
+                };
+
                 SortedList<float, global::Timeline.Keyframe> kfs = interp.keyframes;
+                node.Keyframes = KeyframesToString(kfs);
+
+                int firstEvent = result.Events.Count;
                 if (kfs == null || kfs.Count == 0)
                 {
                     // Not animated; if the item is on right now it will stay on for the whole export.
                     if (IsVisible(ociItem))
-                        result.Add(MakeEvent(se, loopedStart, 0f, audioDuration));
-                    continue;
+                        result.Events.Add(MakeEvent(se, loopedStart, 0f, audioDuration));
+                }
+                else
+                {
+                    CollectKeyframeEvents(se, kfs, loopedStart, duration, audioDuration, IsVisible(ociItem), result.Events);
                 }
 
-                CollectKeyframeEvents(se, kfs, loopedStart, duration, audioDuration, IsVisible(ociItem), result);
+                node.Windows = WindowsToString(result.Events, firstEvent);
+                result.Nodes.Add(node);
             }
 
             return result;
+        }
+
+        private static string GetItemName(OCIItem ociItem)
+        {
+            return ociItem.objectItem != null ? ociItem.objectItem.name : "?";
+        }
+
+        private static string KeyframesToString(SortedList<float, global::Timeline.Keyframe> kfs)
+        {
+            if (kfs == null || kfs.Count == 0)
+                return "(no keyframes)";
+            var sb = new StringBuilder();
+            for (int i = 0; i < kfs.Count; i++)
+            {
+                if (i > 0)
+                    sb.Append(", ");
+                sb.Append(kfs.Keys[i].ToString("0.###"));
+                sb.Append('=');
+                try { sb.Append((bool)kfs.Values[i].value ? "on" : "off"); }
+                catch { sb.Append('?'); }
+            }
+            return sb.ToString();
+        }
+
+        private static string WindowsToString(List<SoundEvent> events, int firstEvent)
+        {
+            if (events.Count == firstEvent)
+                return "(none)";
+            var sb = new StringBuilder();
+            for (int i = firstEvent; i < events.Count; i++)
+            {
+                if (i > firstEvent)
+                    sb.Append(", ");
+                sb.Append(events[i].OnOutput.ToString("0.###"));
+                sb.Append('-');
+                sb.Append(events[i].OffOutput.ToString("0.###"));
+                sb.Append("s");
+            }
+            return sb.ToString();
         }
 
         /// <summary>
@@ -284,6 +379,70 @@ namespace VideoExportAudioProvider
             VideoExportAudioProviderPlugin.Logger.LogInfo(
                 $"Sound '{e.ClipName}' {(e.Loop ? "(loop) " : "")}plays between output {e.OnOutput:0.00}s and {e.OffOutput:0.00}s (enabled at timeline {e.OnTimeTimeline:0.00}s, volume {e.Volume:0.00}).");
             return e;
+        }
+
+        #endregion
+
+        #region Manifest
+
+        /// <summary>
+        /// Writes UserData/StudioSoundManifest.txt comparing the Timeline sound nodes with the
+        /// windows that were actually mixed into this export, plus a per-second activity map.
+        /// </summary>
+        private static void WriteManifest(float startTime, float audioDuration, int sampleRate, CollectResult collected)
+        {
+            try
+            {
+                float tlDuration = TimelineDuration();
+                float loopedStart = LoopStartTime(startTime, tlDuration);
+
+                var sb = new StringBuilder();
+                sb.AppendLine("StudioSoundProvider export manifest");
+                sb.AppendLine($"Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                sb.AppendLine($"Export starts at raw timeline {startTime:0.###}s; timeline duration {tlDuration:0.###}s; looped start {loopedStart:0.###}s");
+                sb.AppendLine($"Audio length {audioDuration:0.###}s @ {sampleRate}Hz; {collected.Nodes.Count} sound node(s); {collected.Events.Count} mix event(s)");
+                sb.AppendLine();
+
+                sb.AppendLine("=== Sound nodes (Timeline 'Enabled' interpolables with SEComponent) ===");
+                if (collected.Nodes.Count == 0)
+                    sb.AppendLine("  (none)");
+                for (int i = 0; i < collected.Nodes.Count; i++)
+                {
+                    NodeDump n = collected.Nodes[i];
+                    sb.AppendLine($"[{i + 1}] item='{n.ItemName}' clip='{n.ClipName}' loop={n.Loop} volume={n.Volume:0.###} channel={n.SoundType}");
+                    sb.AppendLine($"    keyframes: {n.Keyframes}");
+                    sb.AppendLine($"    windows  : {n.Windows}");
+                }
+                sb.AppendLine();
+
+                sb.AppendLine("=== Mix events (what the exported audio actually contains) ===");
+                if (collected.Events.Count == 0)
+                    sb.AppendLine("  (none)");
+                foreach (SoundEvent e in collected.Events.OrderBy(e => e.OnOutput))
+                    sb.AppendLine($"  {e.OnOutput,8:0.###}s -> {e.OffOutput,8:0.###}s : '{e.ClipName}'{(e.Loop ? " loop" : "")} vol={e.Volume:0.###} (enabled at tl {e.OnTimeTimeline:0.###}s)");
+                sb.AppendLine();
+
+                sb.AppendLine("=== Per-second activity map ===");
+                int totalSeconds = Mathf.CeilToInt(audioDuration);
+                for (int s = 0; s < totalSeconds; s++)
+                {
+                    var active = collected.Events
+                        .Where(e => e.OnOutput < s + 1f && e.OffOutput > s)
+                        .OrderBy(e => e.OnOutput)
+                        .Select(e => e.ClipName + (e.Loop ? "*" : ""))
+                        .Distinct()
+                        .ToArray();
+                    sb.AppendLine($"t={s,4}s: " + (active.Length == 0 ? "-" : string.Join(", ", active)));
+                }
+
+                string path = Path.Combine(Path.Combine(Paths.GameRootPath, "UserData"), "StudioSoundManifest.txt");
+                File.WriteAllText(path, sb.ToString());
+                VideoExportAudioProviderPlugin.Logger.LogMessage("[StudioSoundManifest] written to " + path);
+            }
+            catch (Exception e)
+            {
+                VideoExportAudioProviderPlugin.Logger.LogWarning("Failed to write manifest: " + e.Message);
+            }
         }
 
         #endregion

@@ -13,7 +13,7 @@ namespace VideoExportAudioProvider
     {
         public const string GUID = "VideoExportAudioProvider";
         public const string Name = "VideoExportAudioProvider";
-        public const string Version = "1.2.0";
+        public const string Version = "1.3.0";
 
         internal static new ManualLogSource Logger;
         internal static ConfigEntry<bool> MuteDuringExport;
