@@ -19,6 +19,12 @@ namespace VideoExportAudioProvider
     /// be captured live - instead the provider pre-computes every sound item's on/off windows
     /// from the Timeline keyframes in memory, which is exactly what the renderer will apply
     /// frame by frame.
+    ///
+    /// Timeline's raw playback time keeps growing past the timeline length when it loops,
+    /// while the scene renders at (playbackTime % duration). An export can therefore start
+    /// mid-loop (or after several loops) and cover wrapped keyframe occurrences. All event
+    /// math is done on the looped axis: each keyframe's occurrences inside the export range
+    /// are computed and mapped to "output time" (seconds since the first audio sample).
     /// </summary>
     public class StudioSoundProvider : IAudioPlugin
     {
@@ -26,8 +32,9 @@ namespace VideoExportAudioProvider
         {
             public AudioClip Clip;
             public string ClipName;
-            public float OnTime;
-            public float OffTime;
+            public float OnTimeTimeline; // timeline time the clip was enabled at (for in-clip offset)
+            public float OnOutput;      // output time (s) the clip starts playing at
+            public float OffOutput;     // output time (s) the clip stops at
             public bool Loop;
             public float Volume;
         }
@@ -50,8 +57,10 @@ namespace VideoExportAudioProvider
                 int frames = Mathf.CeilToInt(duration * sampleRate);
                 var mix = new float[frames * 2];
 
+                float loopedStart = LoopStartTime(startTime, duration);
+
                 foreach (SoundEvent e in events)
-                    MixEvent(mix, e, startTime, sampleRate);
+                    MixEvent(mix, e, loopedStart, sampleRate);
 
                 byte[] wav = ToWav16(mix, sampleRate);
                 VideoExportAudioProviderPlugin.Logger.LogInfo($"Mixed {events.Count} sound clip event(s) into {wav.Length / 1024} KB of audio.");
@@ -66,7 +75,22 @@ namespace VideoExportAudioProvider
 
         #region Event collection
 
-        private static List<SoundEvent> CollectEvents(float startTime, float endTime)
+        private static float PositiveMod(float value, float modulus)
+        {
+            float m = value % modulus;
+            if (m < 0f)
+                m += modulus;
+            return m;
+        }
+
+        private static float LoopStartTime(float startTime, float timelineDuration)
+        {
+            if (timelineDuration <= 0f)
+                return startTime;
+            return PositiveMod(startTime, timelineDuration);
+        }
+
+        private static List<SoundEvent> CollectEvents(float startTime, float audioDuration)
         {
             var result = new List<SoundEvent>();
 
@@ -80,6 +104,15 @@ namespace VideoExportAudioProvider
             var interpolables = Traverse.Create(timelineSelf).Field("_interpolables").GetValue() as IDictionary;
             if (interpolables == null || interpolables.Count == 0)
                 return result;
+
+            float duration = global::Timeline.Timeline.duration;
+            if (duration <= 0f)
+            {
+                VideoExportAudioProviderPlugin.Logger.LogWarning("Timeline duration is zero, no sound events can be mapped.");
+                return result;
+            }
+
+            float loopedStart = PositiveMod(startTime, duration);
 
             foreach (DictionaryEntry entry in interpolables)
             {
@@ -100,45 +133,107 @@ namespace VideoExportAudioProvider
                 {
                     // Not animated; if the item is on right now it will stay on for the whole export.
                     if (IsVisible(ociItem))
-                        result.Add(MakeEvent(se, startTime, endTime));
+                        result.Add(MakeEvent(se, loopedStart, 0f, audioDuration));
                     continue;
                 }
 
-                bool state = StateAt(kfs, startTime, IsVisible(ociItem));
-                float windowStart = state ? startTime : float.NegativeInfinity;
-
-                for (int i = 0; i < kfs.Count; i++)
-                {
-                    float t = kfs.Keys[i];
-                    if (t <= startTime)
-                        continue;
-                    if (t >= endTime)
-                        break;
-
-                    bool v;
-                    try { v = (bool)kfs.Values[i].value; }
-                    catch { continue; }
-
-                    if (v == state)
-                        continue;
-
-                    if (v)
-                    {
-                        state = true;
-                        windowStart = t;
-                    }
-                    else
-                    {
-                        state = false;
-                        result.Add(MakeEvent(se, windowStart, t));
-                    }
-                }
-
-                if (state)
-                    result.Add(MakeEvent(se, windowStart, endTime));
+                CollectKeyframeEvents(se, kfs, loopedStart, duration, audioDuration, IsVisible(ociItem), result);
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// Walks every occurrence of every keyframe inside the export range (accounting for
+        /// timeline wraps) and records on/off windows in output time.
+        /// </summary>
+        private static void CollectKeyframeEvents(Studio.Sound.SEComponent se,
+                                                  SortedList<float, global::Timeline.Keyframe> kfs,
+                                                  float loopedStart, float duration, float audioDuration,
+                                                  bool fallbackVisible,
+                                                  List<SoundEvent> result)
+        {
+            // What renders at the first frame: the value of the last keyframe at or before
+            // the looped start position (the renderer interpolates from keyframes directly).
+            bool state = false;
+            bool haveState = false;
+            for (int i = 0; i < kfs.Count; i++)
+            {
+                float t = kfs.Keys[i];
+                if (t > loopedStart)
+                    break;
+                try
+                {
+                    state = (bool)kfs.Values[i].value;
+                    haveState = true;
+                }
+                catch { }
+            }
+            if (!haveState)
+                state = fallbackVisible;
+
+            // When (on the looped axis) the currently playing clip was enabled, rising-edge only,
+            // since Timeline only rewrites visibility when the value actually changes.
+            float windowOnTimeline = loopedStart;
+            bool windowOpen = false;
+            if (state)
+            {
+                windowOpen = true;
+                windowOnTimeline = LastEnableTimeAt(kfs, loopedStart, duration);
+            }
+            float windowOnOutput = 0f;
+
+            // Every keyframe occurrence inside the export range: [outputTime, kfTime, value]
+            var occurrences = new List<float[]>();
+            for (int i = 0; i < kfs.Count; i++)
+            {
+                float kfTime = kfs.Keys[i];
+                if (kfTime > duration)
+                    continue;
+
+                bool v;
+                try { v = (bool)kfs.Values[i].value; }
+                catch { continue; }
+
+                float first = PositiveMod(kfTime - loopedStart, duration);
+                for (float o = first; o <= audioDuration; o += duration)
+                    occurrences.Add(new[] { o, kfTime, v ? 1f : 0f });
+            }
+
+            occurrences.Sort((a, b) => a[0].CompareTo(b[0]));
+
+            foreach (float[] occ in occurrences)
+            {
+                float outputTime = occ[0];
+                float kfTime = occ[1];
+                bool v = occ[2] > 0.5f;
+
+                // An occurrence at output 0 is already reflected in the initial state.
+                if (outputTime <= 0f)
+                    continue;
+                if (v == state)
+                    continue;
+
+                if (v)
+                {
+                    state = true;
+                    windowOpen = true;
+                    windowOnTimeline = kfTime;
+                    windowOnOutput = outputTime;
+                }
+                else
+                {
+                    state = false;
+                    if (windowOpen)
+                    {
+                        windowOpen = false;
+                        result.Add(MakeEvent(se, windowOnTimeline, windowOnOutput, outputTime));
+                    }
+                }
+            }
+
+            if (windowOpen)
+                result.Add(MakeEvent(se, windowOnTimeline, windowOnOutput, audioDuration));
         }
 
         private static bool IsVisible(OCIItem ociItem)
@@ -147,34 +242,47 @@ namespace VideoExportAudioProvider
             catch { return false; }
         }
 
-        private static bool StateAt(SortedList<float, global::Timeline.Keyframe> kfs, float time, bool fallback)
+        /// <summary>
+        /// Looping keyframe time of the last rising edge (false -> true) at or before
+        /// loopedStart, i.e. when the clip that is currently playing was enabled.
+        /// </summary>
+        private static float LastEnableTimeAt(SortedList<float, global::Timeline.Keyframe> kfs, float loopedStart, float duration)
         {
-            bool state = fallback;
-            for (int i = kfs.Count - 1; i >= 0; i--)
+            float onTime = loopedStart;
+            bool prev = false;
+            bool seen = false;
+            for (int i = 0; i < kfs.Count; i++)
             {
-                if (kfs.Keys[i] <= time)
-                {
-                    try { state = (bool)kfs.Values[i].value; }
-                    catch { }
+                float t = kfs.Keys[i];
+                if (t > loopedStart)
                     break;
-                }
+                bool v;
+                try { v = (bool)kfs.Values[i].value; }
+                catch { continue; }
+                if (v && !prev)
+                    onTime = t;
+                prev = v;
+                seen = true;
             }
-            return state;
+            if (!seen)
+                return loopedStart;
+            return onTime;
         }
 
-        private static SoundEvent MakeEvent(Studio.Sound.SEComponent se, float onTime, float offTime)
+        private static SoundEvent MakeEvent(Studio.Sound.SEComponent se, float onTimeTimeline, float onOutput, float offOutput)
         {
             var e = new SoundEvent
             {
                 Clip = se.Clip,
                 ClipName = se.Clip.name,
-                OnTime = onTime,
-                OffTime = offTime,
+                OnTimeTimeline = onTimeTimeline,
+                OnOutput = onOutput,
+                OffOutput = offOutput,
                 Loop = se.IsLoop,
                 Volume = se.Volume
             };
             VideoExportAudioProviderPlugin.Logger.LogInfo(
-                $"Sound '{e.ClipName}' {(e.Loop ? "(loop) " : "")}plays between {e.OnTime:0.00}s and {e.OffTime:0.00}s (volume {e.Volume:0.00}).");
+                $"Sound '{e.ClipName}' {(e.Loop ? "(loop) " : "")}plays between output {e.OnOutput:0.00}s and {e.OffOutput:0.00}s (enabled at timeline {e.OnTimeTimeline:0.00}s, volume {e.Volume:0.00}).");
             return e;
         }
 
@@ -182,7 +290,7 @@ namespace VideoExportAudioProvider
 
         #region Mixing
 
-        private static void MixEvent(float[] mix, SoundEvent e, float startTime, int sampleRate)
+        private static void MixEvent(float[] mix, SoundEvent e, float loopedStart, int sampleRate)
         {
             AudioClip clip = e.Clip;
             if (clip == null || clip.samples <= 0)
@@ -208,19 +316,23 @@ namespace VideoExportAudioProvider
             }
 
             int totalOut = mix.Length / 2;
-            int outStart = Mathf.Max(0, Mathf.RoundToInt((e.OnTime - startTime) * sampleRate));
-            int outEnd = Mathf.Min(totalOut, Mathf.RoundToInt((e.OffTime - startTime) * sampleRate));
+            int outStart = Mathf.Clamp(Mathf.RoundToInt(e.OnOutput * sampleRate), 0, totalOut);
+            int outEnd = Mathf.Clamp(Mathf.RoundToInt(e.OffOutput * sampleRate), 0, totalOut);
             if (outEnd <= outStart)
                 return;
 
-            // Where the clip would already be at when the export range begins
+            // How far into the clip playback already is when the window opens. Only a window
+            // starting at output 0 can begin mid-clip (the clip was enabled before the export
+            // range began); every later window starts fresh at its enabling keyframe.
             float posAtStart = 0f;
-            if (e.OnTime < startTime)
+            if (e.OnOutput <= 0f)
             {
-                if (e.Loop)
-                    posAtStart = ((startTime - e.OnTime) * srcRate) % srcFrames;
+                if (e.Loop && srcRate > 0)
+                    posAtStart = PositiveMod(loopedStart - e.OnTimeTimeline, (float)srcFrames / srcRate) * srcRate;
                 else
-                    posAtStart = (startTime - e.OnTime) * srcRate;
+                    posAtStart = (loopedStart - e.OnTimeTimeline) * srcRate;
+                if (posAtStart < 0f)
+                    posAtStart = 0f;
             }
 
             float ratio = (float)srcRate / sampleRate;
