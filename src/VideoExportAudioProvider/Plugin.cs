@@ -1,4 +1,5 @@
-﻿using BepInEx;
+﻿using System;
+using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
@@ -13,7 +14,7 @@ namespace VideoExportAudioProvider
     {
         public const string GUID = "VideoExportAudioProvider";
         public const string Name = "VideoExportAudioProvider";
-        public const string Version = "1.4.0";
+        public const string Version = "1.5.0";
 
         internal static new ManualLogSource Logger;
         internal static ConfigEntry<bool> MuteDuringExport;
@@ -63,8 +64,31 @@ namespace VideoExportAudioProvider
                 return;
             }
 
+            DumpSoundTypeTruth();
+
             Register(videoExport, new StudioSoundProvider());
             Register(videoExport, new FileAudioProvider(_audioFilePath));
+        }
+
+        /// <summary>
+        /// Logs the measured AudioSource prefab properties of every game sound type
+        /// (spatial blend, mixer routing) - the ground truth the StudioSoundProvider's
+        /// spatial approximation is driven by.
+        /// </summary>
+        private void DumpSoundTypeTruth()
+        {
+            try
+            {
+                foreach (Manager.Sound.Type type in Enum.GetValues(typeof(Manager.Sound.Type)))
+                {
+                    Logger.LogInfo("[StudioSoundTruth] type " + type + " (" + (int)type + "): " +
+                                   StudioSoundProvider.DescribeType(type));
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.LogWarning("[StudioSoundTruth] failed to dump sound types: " + e.Message);
+            }
         }
 
         private void Register(global::VideoExport.VideoExport videoExport, VideoExport.AudioPlugins.IAudioPlugin provider)

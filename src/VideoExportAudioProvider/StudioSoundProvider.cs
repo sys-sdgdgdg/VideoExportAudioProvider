@@ -29,6 +29,12 @@ namespace VideoExportAudioProvider
     /// math is done on the looped axis: each keyframe's occurrences inside the export range
     /// are computed and mapped to "output time" (seconds since the first audio sample).
     ///
+    /// Playback replication is grounded in measured data instead of assumptions:
+    /// - per-sound-type AudioSource prefab (spatial blend, mixer routing) read via reflection
+    /// - the game's live AudioMixer channel/master volumes read at export time
+    /// - the camera/listener pose sampled per time block from Timeline camera keyframes
+    ///   (with their easing curves), falling back to the pose at export start
+    ///
     /// Every export also writes UserData/StudioSoundManifest.txt comparing the Timeline
     /// nodes with the sound windows that were actually mixed, for troubleshooting.
     /// </summary>
@@ -44,8 +50,11 @@ namespace VideoExportAudioProvider
             public bool Loop;
             public float Volume;        // the item's own volume (0-1)
             public float ChannelGain;   // game mixer channel x master gain (0-1)
-            public float RolloffGain;   // 3D distance attenuation approximation (0-1)
-            public float Pan;           // stereo pan approximation (-1 left .. 1 right)
+            public float SpatialBlend;  // the sound type prefab's 2D/3D blend (0-1)
+            public Vector3 ItemPos;    // world position of the sound item at export start
+            public float MinD;          // rolloff range start (full volume up to here)
+            public float MaxD;          // rolloff range end
+            public bool LinearRolloff;   // rolloff mode (from the item's decay type)
         }
 
         private class NodeDump
@@ -55,6 +64,7 @@ namespace VideoExportAudioProvider
             public bool Loop;
             public float Volume;
             public string SoundType;
+            public string Playback;
             public string Keyframes;
             public string Windows;
             public string Spatial;
@@ -78,21 +88,23 @@ namespace VideoExportAudioProvider
                 if (collected.Events.Count == 0)
                 {
                     VideoExportAudioProviderPlugin.Logger.LogInfo("No Timeline-triggered studio sounds found for this export.");
-                    WriteManifest(startTime, duration, sampleRate, collected);
+                    WriteManifest(startTime, duration, sampleRate, collected, null);
                     return null;
                 }
 
                 int frames = Mathf.CeilToInt(duration * sampleRate);
                 var mix = new float[frames * 2];
 
-                float loopedStart = LoopStartTime(startTime, TimelineDuration());
+                float tlDuration = TimelineDuration();
+                float loopedStart = LoopStartTime(startTime, tlDuration);
+                CameraPathSampler camera = new CameraPathSampler(loopedStart, tlDuration);
 
                 foreach (SoundEvent e in collected.Events)
-                    MixEvent(mix, e, loopedStart, sampleRate);
+                    MixEvent(mix, e, loopedStart, sampleRate, camera);
 
                 byte[] wav = ToWav16(mix, sampleRate);
                 VideoExportAudioProviderPlugin.Logger.LogInfo($"Mixed {collected.Events.Count} sound clip event(s) into {wav.Length / 1024} KB of audio.");
-                WriteManifest(startTime, duration, sampleRate, collected);
+                WriteManifest(startTime, duration, sampleRate, collected, camera);
                 return new BinaryReader(new MemoryStream(wav));
             }
             catch (Exception e)
@@ -181,11 +193,9 @@ namespace VideoExportAudioProvider
                     SoundType = se.SoundType.ToString()
                 };
 
-                float channelGain = GetChannelGain(se);
-                float rolloffGain;
-                float pan;
-                ComputeSpatial(ociItem, se, out rolloffGain, out pan);
-                node.Spatial = $"dist-rolloff {rolloffGain:0.00}, pan {pan:+0.00;-0.00;0.00}, channel x{channelGain:0.00}";
+                SoundEvent proto = BuildEventPrototype(se);
+                node.Playback = DescribeType(se.SoundType);
+                node.Spatial = DescribeSpatial(proto);
 
                 SortedList<float, global::Timeline.Keyframe> kfs = interp.keyframes;
                 node.Keyframes = KeyframesToString(kfs);
@@ -195,11 +205,11 @@ namespace VideoExportAudioProvider
                 {
                     // Not animated; if the item is on right now it will stay on for the whole export.
                     if (IsVisible(ociItem))
-                        result.Events.Add(MakeEvent(se, loopedStart, 0f, audioDuration, channelGain, rolloffGain, pan));
+                        result.Events.Add(MakeEvent(proto, se, loopedStart, 0f, audioDuration));
                 }
                 else
                 {
-                    CollectKeyframeEvents(se, kfs, loopedStart, duration, audioDuration, IsVisible(ociItem), channelGain, rolloffGain, pan, result.Events);
+                    CollectKeyframeEvents(proto, se, kfs, loopedStart, duration, audioDuration, IsVisible(ociItem), result.Events);
                 }
 
                 node.Windows = WindowsToString(result.Events, firstEvent);
@@ -207,6 +217,41 @@ namespace VideoExportAudioProvider
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// The per-item, time-independent parts of a mix event: clip identity, volumes,
+        /// spatial data and the measured playback characteristics of its sound type.
+        /// </summary>
+        private static SoundEvent BuildEventPrototype(Studio.Sound.SEComponent se)
+        {
+            TypeAudioInfo info = GetTypeAudioInfo(se.SoundType);
+            float blend = info != null && info.Valid ? info.SpatialBlend : 0f;
+
+            var proto = new SoundEvent
+            {
+                Clip = se.Clip,
+                ClipName = se.Clip.name,
+                Loop = se.IsLoop,
+                Volume = se.Volume,
+                ChannelGain = GetChannelGain(se),
+                SpatialBlend = blend,
+                ItemPos = se.transform.position,
+                MinD = 0f,
+                MaxD = 0f,
+                LinearRolloff = Convert.ToInt32(se.DecayType) == 0
+            };
+
+            try
+            {
+                proto.MinD = se.RolloffDistance.min;
+                proto.MaxD = se.RolloffDistance.max;
+                if (proto.MaxD <= proto.MinD)
+                    proto.MaxD = proto.MinD + 1f;
+            }
+            catch { }
+
+            return proto;
         }
 
         private static string GetItemName(OCIItem ociItem)
@@ -252,11 +297,10 @@ namespace VideoExportAudioProvider
         /// Walks every occurrence of every keyframe inside the export range (accounting for
         /// timeline wraps) and records on/off windows in output time.
         /// </summary>
-        private static void CollectKeyframeEvents(Studio.Sound.SEComponent se,
+        private static void CollectKeyframeEvents(SoundEvent proto, Studio.Sound.SEComponent se,
                                                   SortedList<float, global::Timeline.Keyframe> kfs,
                                                   float loopedStart, float duration, float audioDuration,
                                                   bool fallbackVisible,
-                                                  float channelGain, float rolloffGain, float pan,
                                                   List<SoundEvent> result)
         {
             // What renders at the first frame: the value of the last keyframe at or before
@@ -333,13 +377,13 @@ namespace VideoExportAudioProvider
                     if (windowOpen)
                     {
                         windowOpen = false;
-                        result.Add(MakeEvent(se, windowOnTimeline, windowOnOutput, outputTime, channelGain, rolloffGain, pan));
+                        result.Add(MakeEvent(proto, se, windowOnTimeline, windowOnOutput, outputTime));
                     }
                 }
             }
 
             if (windowOpen)
-                result.Add(MakeEvent(se, windowOnTimeline, windowOnOutput, audioDuration, channelGain, rolloffGain, pan));
+                result.Add(MakeEvent(proto, se, windowOnTimeline, windowOnOutput, audioDuration));
         }
 
         private static bool IsVisible(OCIItem ociItem)
@@ -375,34 +419,25 @@ namespace VideoExportAudioProvider
             return onTime;
         }
 
-        private static SoundEvent MakeEvent(Studio.Sound.SEComponent se, float onTimeTimeline, float onOutput, float offOutput, float channelGain, float rolloffGain, float pan)
+        private static SoundEvent MakeEvent(SoundEvent proto, Studio.Sound.SEComponent se, float onTimeTimeline, float onOutput, float offOutput)
         {
-            var e = new SoundEvent
-            {
-                Clip = se.Clip,
-                ClipName = se.Clip.name,
-                OnTimeTimeline = onTimeTimeline,
-                OnOutput = onOutput,
-                OffOutput = offOutput,
-                Loop = se.IsLoop,
-                Volume = se.Volume,
-                ChannelGain = channelGain,
-                RolloffGain = rolloffGain,
-                Pan = pan
-            };
+            proto.OnTimeTimeline = onTimeTimeline;
+            proto.OnOutput = onOutput;
+            proto.OffOutput = offOutput;
             VideoExportAudioProviderPlugin.Logger.LogInfo(
-                $"Sound '{e.ClipName}' {(e.Loop ? "(loop) " : "")}plays between output {e.OnOutput:0.00}s and {e.OffOutput:0.00}s (enabled at timeline {e.OnTimeTimeline:0.00}s, volume {e.Volume:0.00}).");
-            return e;
+                $"Sound '{proto.ClipName}' {(proto.Loop ? "(loop) " : "")}plays between output {proto.OnOutput:0.00}s and {proto.OffOutput:0.00}s (enabled at timeline {proto.OnTimeTimeline:0.00}s, volume {proto.Volume:0.00}, blend {proto.SpatialBlend:0.00}).");
+            return proto;
         }
 
         #endregion
 
-        #region Channel & spatial approximation
+        #region Measured playback data
 
         /// <summary>
         /// The game's per-channel volume (options screen) is routed through the AudioMixer:
         /// Config.SoundSystem sliders call MixerVolume.Set(mixer, param, v) with
-        /// dB = 20*log10(v). Reading the current exposed parameter reproduces the exact gain.
+        /// dB = 20*log10(v). Reading the current exposed parameter reproduces the exact gain -
+        /// but only for sources actually routed through a mixer group.
         /// </summary>
         private static float MixerLinear(string exposedParam, float fallback)
         {
@@ -439,6 +474,11 @@ namespace VideoExportAudioProvider
         {
             if (!VideoExportAudioProviderPlugin.ApplyChannelVolume.Value)
                 return 1f;
+            // Sources without a mixer group bypass the mixer entirely in-game - the channel
+            // sliders do nothing for them there, and must do nothing here.
+            TypeAudioInfo info = GetTypeAudioInfo(se.SoundType);
+            if (info != null && info.Valid && string.IsNullOrEmpty(info.MixerGroup))
+                return 1f;
             string param = ChannelParam(se.SoundType);
             if (param == null)
                 return 1f;
@@ -446,54 +486,258 @@ namespace VideoExportAudioProvider
         }
 
         /// <summary>
-        /// Approximates Unity 3D audio for the export: distance rolloff from the listener
-        /// (studio camera at export start) plus constant-power stereo panning from the
-        /// camera-relative direction. Items beyond their max distance are inaudible, like
-        /// Unity's voice virtualization culls them.
+        /// Live per-sound-type AudioSource prefab info (the truth about how this type actually
+        /// plays in-game): spatialBlend decides how much distance attenuation applies,
+        /// outputAudioMixerGroup decides whether the game's channel volume applies.
         /// </summary>
-        private static void ComputeSpatial(OCIItem ociItem, Studio.Sound.SEComponent se, out float rolloffGain, out float pan)
+        private class TypeAudioInfo
         {
-            rolloffGain = 1f;
-            pan = 0f;
-            if (!VideoExportAudioProviderPlugin.SpatialAudioApproximation.Value)
-                return;
+            public bool Valid;
+            public float SpatialBlend;
+            public string MixerGroup;
+        }
 
+        private static readonly Dictionary<int, TypeAudioInfo> _typeInfoCache = new Dictionary<int, TypeAudioInfo>();
+
+        private static TypeAudioInfo GetTypeAudioInfo(Manager.Sound.Type type)
+        {
+            int key = (int)type;
+            TypeAudioInfo cached;
+            if (_typeInfoCache.TryGetValue(key, out cached))
+                return cached;
+
+            var info = new TypeAudioInfo();
             try
             {
-                Camera listener = Studio.Studio.Instance.cameraCtrl.mainCmaera;
-                if (listener == null || ociItem.objectItem == null)
+                var sound = Singleton<Manager.Sound>.Instance;
+                if (sound != null)
+                {
+                    GameObject go = null;
+                    var settingObjects = Traverse.Create(sound).Field("settingObjects").GetValue();
+                    if (settingObjects is GameObject[] goArr && key < goArr.Length)
+                    {
+                        go = goArr[key];
+                    }
+                    else if (settingObjects is UnityEngine.Component[] compArr && key < compArr.Length && compArr[key] != null)
+                    {
+                        go = compArr[key].gameObject;
+                    }
+                    else if (settingObjects is Array rawArr && key < rawArr.Length)
+                    {
+                        var raw = rawArr.GetValue(key);
+                        go = raw as GameObject ?? (raw as UnityEngine.Component)?.gameObject;
+                    }
+                    AudioSource src = go != null ? go.GetComponent<AudioSource>() : null;
+                    if (src == null && go != null)
+                        src = go.GetComponentInChildren<AudioSource>();
+                    if (src != null)
+                    {
+                        info.SpatialBlend = src.spatialBlend;
+                        try { info.MixerGroup = src.outputAudioMixerGroup != null ? src.outputAudioMixerGroup.name : null; }
+                        catch { info.MixerGroup = null; }
+                        info.Valid = true;
+                    }
+                }
+            }
+            catch { }
+            _typeInfoCache[key] = info;
+            return info;
+        }
+
+        internal static string DescribeType(Manager.Sound.Type type)
+        {
+            TypeAudioInfo info = GetTypeAudioInfo(type);
+            if (info == null || !info.Valid)
+                return "prefab unknown (treated as 2D, no channel gain)";
+            return "3D blend " + info.SpatialBlend.ToString("0.00") +
+                   ", mixer group " + (string.IsNullOrEmpty(info.MixerGroup) ? "(none - bypasses mixer)" : "'" + info.MixerGroup + "'");
+        }
+
+        private static string DescribeSpatial(SoundEvent e)
+        {
+            if (e.SpatialBlend <= 0.001f)
+                return "2D source: no distance rolloff, centered";
+            return "rolloff " + (e.LinearRolloff ? "linear" : "log") + " " + e.MinD.ToString("0.##") + "-" + e.MaxD.ToString("0.##") + "m, 3D blend " + e.SpatialBlend.ToString("0.00") +
+                   ", channel gain x" + e.ChannelGain.ToString("0.00");
+        }
+
+        #endregion
+
+        #region Camera path
+
+        /// <summary>
+        /// Samples the studio camera (audio listener) pose at any output time, following the
+        /// Timeline "Camera Position"/"Camera Rotation" keyframes including their easing
+        /// curves - the same values the exported frames are rendered with. Falls back to the
+        /// camera pose at export start when the camera is not keyframed.
+        /// </summary>
+        private class CameraPathSampler
+        {
+            private struct VecKey { public float Time; public Vector3 Value; public AnimationCurve Curve; }
+            private struct QuatKey { public float Time; public Quaternion Value; public AnimationCurve Curve; }
+
+            private readonly List<VecKey> _pos;
+            private readonly List<QuatKey> _rot;
+            private readonly float _loopedStart;
+            private readonly float _duration;
+            private Vector3 _fallbackPos;
+            private Quaternion _fallbackRot = Quaternion.identity;
+            private bool _haveFallback;
+
+            public string Description
+            {
+                get
+                {
+                    if (_pos == null && _rot == null)
+                        return _haveFallback ? "static (camera not keyframed in Timeline; pose at export start)" : "static (camera unavailable)";
+                    return "tracked from Timeline camera keyframes (pos " + (_pos == null ? "-" : _pos.Count.ToString()) + ", rot " + (_rot == null ? "-" : _rot.Count.ToString()) + ")";
+                }
+            }
+
+            public CameraPathSampler(float loopedStart, float duration)
+            {
+                _loopedStart = loopedStart;
+                _duration = duration;
+
+                try
+                {
+                    Camera fallback = Studio.Studio.Instance.cameraCtrl.mainCmaera;
+                    if (fallback != null)
+                    {
+                        _fallbackPos = fallback.transform.position;
+                        _fallbackRot = fallback.transform.rotation;
+                        _haveFallback = true;
+                    }
+                }
+                catch { }
+
+                if (!VideoExportAudioProviderPlugin.SpatialAudioApproximation.Value)
                     return;
 
-                Vector3 toItem = se.transform.position - listener.transform.position;
-                float dist = toItem.magnitude;
+                try
+                {
+                    var timelineSelf = Traverse.Create(typeof(global::Timeline.Timeline)).Field("_self").GetValue() as global::Timeline.Timeline;
+                    if (timelineSelf == null)
+                        return;
+                    var interpolables = Traverse.Create(timelineSelf).Field("_interpolables").GetValue() as IDictionary;
+                    if (interpolables == null)
+                        return;
 
-                float minD = se.RolloffDistance.min;
-                float maxD = se.RolloffDistance.max;
-                if (maxD <= minD)
-                    maxD = minD + 1f;
+                    foreach (DictionaryEntry entry in interpolables)
+                    {
+                        var interp = entry.Value as global::Timeline.Interpolable;
+                        if (interp == null || !interp.enabled)
+                            continue;
 
-                if (dist <= minD)
-                    rolloffGain = 1f;
-                else if (dist >= maxD)
-                    rolloffGain = 0f;
-                else if (Convert.ToInt32(se.DecayType) == 0) // first RolloffType member = Linear (see OnEnable)
-                    rolloffGain = (maxD - dist) / (maxD - minD);
-                else
-                    rolloffGain = Mathf.Clamp01(minD / dist); // logarithmic approximation
-
-                // Constant-power pan from the lateral component of the direction.
-                Vector3 flat = toItem;
-                flat.y = 0f;
-                Vector3 right = listener.transform.right;
-                right.y = 0f;
-                right.Normalize();
-                float len = flat.magnitude;
-                pan = len > 0.001f ? Mathf.Clamp(Vector3.Dot(flat / len, right), -1f, 1f) : 0f;
+                        if (interp.id == "cameraPos")
+                            _pos = ReadVecKeys(interp.keyframes);
+                        else if (interp.id == "cameraRot")
+                            _rot = ReadQuatKeys(interp.keyframes);
+                    }
+                }
+                catch (Exception e)
+                {
+                    VideoExportAudioProviderPlugin.Logger.LogWarning("Camera path sampling unavailable: " + e.Message);
+                }
             }
-            catch
+
+            private static List<VecKey> ReadVecKeys(SortedList<float, global::Timeline.Keyframe> kfs)
             {
-                rolloffGain = 1f;
-                pan = 0f;
+                if (kfs == null || kfs.Count == 0)
+                    return null;
+                var list = new List<VecKey>(kfs.Count);
+                for (int i = 0; i < kfs.Count; i++)
+                {
+                    try
+                    {
+                        list.Add(new VecKey { Time = kfs.Keys[i], Value = (Vector3)kfs.Values[i].value, Curve = kfs.Values[i].curve });
+                    }
+                    catch { }
+                }
+                return list.Count > 0 ? list : null;
+            }
+
+            private static List<QuatKey> ReadQuatKeys(SortedList<float, global::Timeline.Keyframe> kfs)
+            {
+                if (kfs == null || kfs.Count == 0)
+                    return null;
+                var list = new List<QuatKey>(kfs.Count);
+                for (int i = 0; i < kfs.Count; i++)
+                {
+                    try
+                    {
+                        list.Add(new QuatKey { Time = kfs.Keys[i], Value = (Quaternion)kfs.Values[i].value, Curve = kfs.Values[i].curve });
+                    }
+                    catch { }
+                }
+                return list.Count > 0 ? list : null;
+            }
+
+            public Vector3 PositionAt(float outputTime)
+            {
+                if (_pos == null)
+                    return _fallbackPos;
+                return SampleVec(_pos, TimelineTime(outputTime));
+            }
+
+            public Quaternion RotationAt(float outputTime)
+            {
+                if (_rot == null)
+                    return _fallbackRot;
+                return SampleQuat(_rot, TimelineTime(outputTime));
+            }
+
+            private float TimelineTime(float outputTime)
+            {
+                float t = _loopedStart + outputTime;
+                if (_duration > 0f)
+                    t = PositiveMod(t, _duration);
+                return t;
+            }
+
+            private static float Factor(AnimationCurve curve, float leftTime, float rightTime, float time)
+            {
+                float span = rightTime - leftTime;
+                if (span <= 0f)
+                    return 0f;
+                float normalized = (time - leftTime) / span;
+                if (curve != null && curve.length > 0)
+                    return Mathf.Clamp01(curve.Evaluate(normalized));
+                return Mathf.Clamp01(normalized);
+            }
+
+            private static Vector3 SampleVec(List<VecKey> keys, float time)
+            {
+                if (time <= keys[0].Time)
+                    return keys[0].Value;
+                if (time >= keys[keys.Count - 1].Time)
+                    return keys[keys.Count - 1].Value;
+                for (int i = 0; i < keys.Count - 1; i++)
+                {
+                    if (time >= keys[i].Time && time <= keys[i + 1].Time)
+                    {
+                        float f = Factor(keys[i].Curve, keys[i].Time, keys[i + 1].Time, time);
+                        return Vector3.LerpUnclamped(keys[i].Value, keys[i + 1].Value, f);
+                    }
+                }
+                return keys[keys.Count - 1].Value;
+            }
+
+            private static Quaternion SampleQuat(List<QuatKey> keys, float time)
+            {
+                if (time <= keys[0].Time)
+                    return keys[0].Value;
+                if (time >= keys[keys.Count - 1].Time)
+                    return keys[keys.Count - 1].Value;
+                for (int i = 0; i < keys.Count - 1; i++)
+                {
+                    if (time >= keys[i].Time && time <= keys[i + 1].Time)
+                    {
+                        float f = Factor(keys[i].Curve, keys[i].Time, keys[i + 1].Time, time);
+                        return Quaternion.SlerpUnclamped(keys[i].Value, keys[i + 1].Value, f);
+                    }
+                }
+                return keys[keys.Count - 1].Value;
             }
         }
 
@@ -505,7 +749,7 @@ namespace VideoExportAudioProvider
         /// Writes UserData/StudioSoundManifest.txt comparing the Timeline sound nodes with the
         /// windows that were actually mixed into this export, plus a per-second activity map.
         /// </summary>
-        private static void WriteManifest(float startTime, float audioDuration, int sampleRate, CollectResult collected)
+        private static void WriteManifest(float startTime, float audioDuration, int sampleRate, CollectResult collected, CameraPathSampler camera)
         {
             try
             {
@@ -519,7 +763,9 @@ namespace VideoExportAudioProvider
                 sb.AppendLine($"Audio length {audioDuration:0.###}s @ {sampleRate}Hz; {collected.Nodes.Count} sound node(s); {collected.Events.Count} mix event(s)");
                 if (VideoExportAudioProviderPlugin.ApplyChannelVolume.Value)
                     sb.AppendLine($"Mixer gains applied: Master x{MixerLinear("MasterVolume", 1f):0.00}, BGM x{MixerLinear("BGMVolume", 1f):0.00}, ENV x{MixerLinear("ENVVolume", 1f):0.00}, SystemSE x{MixerLinear("SystemSEVolume", 1f):0.00}, GameSE x{MixerLinear("GameSEVolume", 1f):0.00}");
-                sb.AppendLine($"Spatial approximation: {(VideoExportAudioProviderPlugin.SpatialAudioApproximation.Value ? "on (listener = camera at export start)" : "off")}");
+                else
+                    sb.AppendLine("Mixer gains: skipped (Apply game channel volume = false)");
+                sb.AppendLine($"Listener/camera: {(camera != null ? camera.Description : "n/a")}");
                 sb.AppendLine();
 
                 sb.AppendLine("=== Sound nodes (Timeline 'Enabled' interpolables with SEComponent) ===");
@@ -529,9 +775,10 @@ namespace VideoExportAudioProvider
                 {
                     NodeDump n = collected.Nodes[i];
                     sb.AppendLine($"[{i + 1}] item='{n.ItemName}' clip='{n.ClipName}' loop={n.Loop} volume={n.Volume:0.###} channel={n.SoundType}");
+                    sb.AppendLine($"    playback : {n.Playback}");
+                    sb.AppendLine($"    spatial  : {n.Spatial}");
                     sb.AppendLine($"    keyframes: {n.Keyframes}");
                     sb.AppendLine($"    windows  : {n.Windows}");
-                    sb.AppendLine($"    spatial  : {n.Spatial}");
                 }
                 sb.AppendLine();
 
@@ -539,7 +786,7 @@ namespace VideoExportAudioProvider
                 if (collected.Events.Count == 0)
                     sb.AppendLine("  (none)");
                 foreach (SoundEvent e in collected.Events.OrderBy(e => e.OnOutput))
-                    sb.AppendLine($"  {e.OnOutput,8:0.###}s -> {e.OffOutput,8:0.###}s : '{e.ClipName}'{(e.Loop ? " loop" : "")} vol={e.Volume:0.###} (enabled at tl {e.OnTimeTimeline:0.###}s)");
+                    sb.AppendLine($"  {e.OnOutput,8:0.###}s -> {e.OffOutput,8:0.###}s : '{e.ClipName}'{(e.Loop ? " loop" : "")} vol={e.Volume:0.###} blend={e.SpatialBlend:0.00} channel x{e.ChannelGain:0.00} (enabled at tl {e.OnTimeTimeline:0.###}s)");
                 sb.AppendLine();
 
                 sb.AppendLine("=== Per-second activity map ===");
@@ -569,7 +816,7 @@ namespace VideoExportAudioProvider
 
         #region Mixing
 
-        private static void MixEvent(float[] mix, SoundEvent e, float loopedStart, int sampleRate)
+        private static void MixEvent(float[] mix, SoundEvent e, float loopedStart, int sampleRate, CameraPathSampler camera)
         {
             AudioClip clip = e.Clip;
             if (clip == null || clip.samples <= 0)
@@ -618,13 +865,27 @@ namespace VideoExportAudioProvider
             int leftCh = 0;
             int rightCh = srcCh >= 2 ? 1 : 0;
 
-            float gain = e.Volume * e.ChannelGain * e.RolloffGain;
-            float panAngle = (e.Pan + 1f) * Mathf.PI * 0.25f;
-            float panL = Mathf.Cos(panAngle);
-            float panR = Mathf.Sin(panAngle);
+            float baseGain = e.Volume * e.ChannelGain;
+
+            // Evaluate the spatial approximation in time blocks so the listener (camera)
+            // pose, distance rolloff and panning follow the camera path.
+            int block = Mathf.Max(1, sampleRate / 20); // 50 ms
+            float gainL2D = 1f, gainR2D = 1f;   // 2D part: full volume, original channel mapping
+            float gainL3D = 0f, gainR3D = 0f;   // 3D part: mono downmix, attenuated and panned
 
             for (int n = outStart; n < outEnd; n++)
             {
+                int blockIndex = (n - outStart) / block;
+                if (n == outStart || blockIndex != (n - outStart - 1) / block)
+                {
+                    float t = (n - outStart) / (float)sampleRate + e.OnOutput;
+                    ComputeGains(e, camera, t, out gainL3D, out gainR3D);
+                    gainL2D = 1f - e.SpatialBlend;
+                    gainR2D = 1f - e.SpatialBlend;
+                    gainL3D *= baseGain;
+                    gainR3D *= baseGain;
+                }
+
                 float srcPos = posAtStart + (n - outStart) * ratio;
                 if (e.Loop)
                 {
@@ -641,11 +902,90 @@ namespace VideoExportAudioProvider
                     i1 = e.Loop ? 0 : srcFrames - 1;
                 float frac = srcPos - i0;
 
-                float l = Mathf.Lerp(data[i0 * srcCh + leftCh], data[i1 * srcCh + leftCh], frac) * gain * panL;
-                float r = Mathf.Lerp(data[i0 * srcCh + rightCh], data[i1 * srcCh + rightCh], frac) * gain * panR;
+                float sl = Mathf.Lerp(data[i0 * srcCh + leftCh], data[i1 * srcCh + leftCh], frac);
+                float sr = Mathf.Lerp(data[i0 * srcCh + rightCh], data[i1 * srcCh + rightCh], frac);
+
+                // Unity spatial blend: 2D keeps the original channel mapping at full volume,
+                // 3D downmixes to mono and attenuates/pannes by distance and direction.
+                float mono = (sl + sr) * 0.5f;
+                float l = sl * gainL2D * baseGain + mono * gainL3D;
+                float r = sr * gainR2D * baseGain + mono * gainR3D;
 
                 mix[n * 2] += l;
                 mix[n * 2 + 1] += r;
+            }
+        }
+
+        /// <summary>
+        /// Per-block stereo gains for the 3D portion of the sound: distance rolloff
+        /// (Unity 5.6 semantics - see ComputeGains inline notes) and constant-power panning
+        /// from the camera-relative direction, following the camera path.
+        /// </summary>
+        private static void ComputeGains(SoundEvent e, CameraPathSampler camera, float outputTime, out float gainL3D, out float gainR3D)
+        {
+            gainL3D = 0f;
+            gainR3D = 0f;
+            if (!VideoExportAudioProviderPlugin.SpatialAudioApproximation.Value || camera == null || e.SpatialBlend <= 0.001f)
+                return;
+
+            try
+            {
+                Vector3 listenerPos = camera.PositionAt(outputTime);
+                Quaternion listenerRot = camera.RotationAt(outputTime);
+
+                Vector3 toItem = e.ItemPos - listenerPos;
+                float dist = toItem.magnitude;
+
+                float rolloff;
+                if (dist <= e.MinD)
+                {
+                    rolloff = 1f;
+                }
+                else
+                {
+                    // Unity 5.6 manual: beyond Max Distance the sound "stays at the volume it
+                    // would be at MaxDistance units from the listener and will not attenuate
+                    // any more". Linear reaches 0 at Max Distance; logarithmic flattens at the
+                    // Max Distance value and never goes silent.
+                    float gainAtMax;
+                    if (e.LinearRolloff)
+                    {
+                        gainAtMax = 0f;
+                        if (dist >= e.MaxD)
+                            rolloff = 0f;
+                        else
+                            rolloff = (e.MaxD - dist) / (e.MaxD - e.MinD);
+                    }
+                    else
+                    {
+                        // Builtin logarithmic rolloff approximates minD/d (never zero).
+                        // minD = 0 would be a division trap; use a 1/(1+d) shape instead.
+                        gainAtMax = e.MinD > 0f ? e.MinD / e.MaxD : 1f / (1f + e.MaxD);
+                        float curved = e.MinD > 0f ? e.MinD / dist : 1f / (1f + dist);
+                        rolloff = Mathf.Clamp(Mathf.Max(curved, gainAtMax), 0f, 1f);
+                    }
+                }
+
+                // Unity blends the 2D and 3D parts; the 3D part is a mono downmix so the
+                // panning below works on a single signal.
+                float pan = 0f;
+                Vector3 flat = toItem;
+                flat.y = 0f;
+                Vector3 right = listenerRot * Vector3.right;
+                right.y = 0f;
+                right.Normalize();
+                float len = flat.magnitude;
+                if (len > 0.001f)
+                    pan = Mathf.Clamp(Vector3.Dot(flat / len, right), -1f, 1f) * e.SpatialBlend;
+
+                float panAngle = (pan + 1f) * Mathf.PI * 0.25f;
+                gainL3D = rolloff * e.SpatialBlend * Mathf.Cos(panAngle);
+                gainR3D = rolloff * e.SpatialBlend * Mathf.Sin(panAngle);
+            }
+            catch
+            {
+                gainL3D = 0f;
+                gainR3D = 0f;
             }
         }
 
